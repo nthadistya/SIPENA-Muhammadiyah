@@ -117,6 +117,13 @@ def init():
         created_at INTEGER NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS password_reset_codes (
+        email TEXT PRIMARY KEY,
+        code_hash TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0
+    )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_murid_ustadzah ON murid(ustadzah_id, no_absen)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_tugas_ustadzah ON tugas(ustadzah_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_materi_ustadzah ON materi(ustadzah_id)")
@@ -181,7 +188,7 @@ def hash_login_code(email, code):
     return hmac.new(key, f"{email}:{code}".encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def kirim_kode_login(email, code):
+def kirim_kode_login(email, code, subject="Kode verifikasi login SIPENA"):
     host = os.environ.get("SMTP_HOST", "").strip()
     username = os.environ.get("SMTP_USERNAME", "").strip()
     password = os.environ.get("SMTP_PASSWORD", "")
@@ -196,11 +203,11 @@ def kirim_kode_login(email, code):
         return "Email belum dikonfigurasi. Pengelola perlu mengatur SMTP_HOST, SMTP_USERNAME, dan SMTP_PASSWORD.", 503
 
     message = EmailMessage()
-    message["Subject"] = "Kode verifikasi login SIPENA"
+    message["Subject"] = subject
     message["From"] = sender
     message["To"] = email
     message.set_content(
-        f"Kode verifikasi login SIPENA Anda adalah {code}.\n"
+        f"Kode verifikasi SIPENA Anda adalah {code}.\n"
         "Kode berlaku selama 10 menit. Jangan bagikan kode ini kepada siapa pun."
     )
     try:
@@ -438,6 +445,103 @@ def verifikasi_kode_login_email():
     session.clear()
     session["me"] = {"r": "u", "id": username, "nama": display_name}
     return {"ok": 1, "me": session["me"], "created": account is None}
+
+
+@app.post("/api/auth/password/request-reset")
+def minta_kode_reset_sandi():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return {"error": "Data email tidak valid."}, 400
+    email = str(body.get("email", "")).strip().lower()
+    if len(email) > 254 or not re.fullmatch(r"[^@\s]{1,64}@[^@\s.]+(?:\.[^@\s.]+)+", email):
+        return {"error": "Masukkan alamat email yang valid."}, 400
+
+    success = {
+        "ok": 1,
+        "message": "Jika email terdaftar, kode pemulihan akan dikirim. Jika baru meminta kode, tunggu hingga 60 detik.",
+    }
+    now = int(time.time())
+    with db() as connection:
+        connection.execute("DELETE FROM password_reset_codes WHERE expires_at<=?", (now,))
+        previous = connection.execute(
+            "SELECT created_at FROM password_reset_codes WHERE email=?", (email,)
+        ).fetchone()
+        if previous and now - previous["created_at"] < 60:
+            return success
+        account = connection.execute(
+            "SELECT 1 FROM akun WHERE role='u' AND (lower(email)=? OR lower(google_email)=?)",
+            (email, email),
+        ).fetchone()
+        if not account:
+            return success
+
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        code_hash = hash_login_code(email, code)
+        connection.execute(
+            "INSERT INTO password_reset_codes(email,code_hash,expires_at,created_at,attempts) "
+            "VALUES(?,?,?,?,0) ON CONFLICT(email) DO UPDATE SET "
+            "code_hash=excluded.code_hash,expires_at=excluded.expires_at,"
+            "created_at=excluded.created_at,attempts=0",
+            (email, code_hash, now + 600, now),
+        )
+
+    error, status = kirim_kode_login(email, code, "Kode pemulihan password SIPENA")
+    if error:
+        with db() as connection:
+            connection.execute(
+                "DELETE FROM password_reset_codes WHERE email=? AND code_hash=?",
+                (email, code_hash),
+            )
+        return {"error": error}, status
+    return success
+
+
+@app.post("/api/auth/password/reset")
+def reset_sandi_dengan_kode():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return {"error": "Data pemulihan tidak valid."}, 400
+    email = str(body.get("email", "")).strip().lower()
+    code = str(body.get("code", "")).strip()
+    password = str(body.get("password", ""))
+    if (len(email) > 254
+            or not re.fullmatch(r"[^@\s]{1,64}@[^@\s.]+(?:\.[^@\s.]+)+", email)
+            or not re.fullmatch(r"\d{6}", code)
+            or len(password) < 8 or len(password) > 256):
+        return {"error": "Email, kode, atau password tidak valid. Password minimal 8 karakter."}, 400
+
+    with db() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        record = connection.execute(
+            "SELECT code_hash,expires_at,attempts FROM password_reset_codes WHERE email=?",
+            (email,),
+        ).fetchone()
+        if not record:
+            return {"error": "Kode pemulihan tidak ditemukan. Minta kode baru."}, 400
+        if record["expires_at"] <= int(time.time()):
+            connection.execute("DELETE FROM password_reset_codes WHERE email=?", (email,))
+            return {"error": "Kode pemulihan sudah kedaluwarsa. Minta kode baru."}, 400
+        if record["attempts"] >= 5:
+            return {"error": "Batas percobaan kode tercapai. Minta kode pemulihan baru."}, 429
+        if not hmac.compare_digest(record["code_hash"], hash_login_code(email, code)):
+            connection.execute(
+                "UPDATE password_reset_codes SET attempts=attempts+1 WHERE email=?",
+                (email,),
+            )
+            return {"error": "Kode pemulihan salah. Periksa email lalu coba lagi."}, 401
+        account = connection.execute(
+            "SELECT username FROM akun WHERE role='u' AND (lower(email)=? OR lower(google_email)=?)",
+            (email, email),
+        ).fetchone()
+        if not account:
+            connection.execute("DELETE FROM password_reset_codes WHERE email=?", (email,))
+            return {"error": "Akun tidak dapat dipulihkan. Hubungi pengelola."}, 400
+        connection.execute(
+            "UPDATE akun SET password_hash=? WHERE username=?",
+            (generate_password_hash(password), account["username"]),
+        )
+        connection.execute("DELETE FROM password_reset_codes WHERE email=?", (email,))
+    return {"ok": 1, "message": "Password berhasil diperbarui. Silakan masuk dengan password baru."}
 
 
 @app.post("/api/logout")
