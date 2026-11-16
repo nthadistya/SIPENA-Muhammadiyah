@@ -54,3 +54,5 @@ passwordObserver.observe(document.getElementById('app'), {
 });
 
 initPasswordEyes();
+
+// ===== AKHIR FITUR MATA PASSWORD =====
